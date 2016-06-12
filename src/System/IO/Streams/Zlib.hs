@@ -20,7 +20,7 @@ module System.IO.Streams.Zlib
 
 ------------------------------------------------------------------------------
 import           Control.Exception                (throwIO)
-import           Control.Monad                    (join)
+import           Control.Monad                    (join, unless)
 import           Data.ByteString                  (ByteString)
 import qualified Data.ByteString                  as S
 import           Data.IORef                       (newIORef, readIORef, writeIORef)
@@ -84,7 +84,7 @@ inflateOne fmt params input = do
                   writeIORef ref next
                   return (Just out)
               DecompressStreamEnd crumb -> do
-                  unRead crumb input
+                  unless (S.null crumb) $ unRead crumb input
                   return Nothing
               DecompressStreamError err -> do
                   throwIO err
@@ -111,7 +111,7 @@ inflateMulti magic0 magic1 fmt params input = do
                   writeIORef ref (next >>= go)
                   return (Just out)
               DecompressStreamEnd crumb -> do
-                  unRead crumb input
+                  unless (S.null crumb) $ unRead crumb input
                   continue <- checkMagicBytes magic0 magic1 input
                   if continue
                   then init
