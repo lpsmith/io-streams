@@ -128,6 +128,7 @@ Library
                      time               >= 1.2   && <1.7,
                      transformers       >= 0.2   && <0.6,
                      vector             >= 0.7   && <0.12,
+                     zlib               >= 0.6   && <0.7,
                      zlib-bindings      >= 0.1   && <0.2
 
   if impl(ghc >= 7.2)

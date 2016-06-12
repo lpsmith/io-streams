@@ -5,6 +5,7 @@
 module System.IO.Streams.Zlib
  ( -- * ByteString decompression
    gunzip
+ , gunzipOne
  , decompress
    -- * ByteString compression
  , gzip
@@ -18,18 +19,22 @@ module System.IO.Streams.Zlib
  ) where
 
 ------------------------------------------------------------------------------
+import           Control.Exception                (throwIO)
+import           Control.Monad                    (join)
 import           Data.ByteString                  (ByteString)
 import qualified Data.ByteString                  as S
 import           Data.IORef                       (newIORef, readIORef, writeIORef)
+import           Data.Word                        (Word8)
 import           Prelude                          hiding (read)
 ------------------------------------------------------------------------------
-import           Codec.Zlib                       (Deflate, Inflate, Popper, WindowBits (..), feedDeflate, feedInflate, finishDeflate, finishInflate, flushDeflate, flushInflate, initDeflate, initInflate)
+import           Codec.Compression.Zlib.Internal  (Format, DecompressParams, DecompressStream(..), decompressIO, zlibFormat, gzipFormat, defaultDecompressParams)
+import           Codec.Zlib                       (Deflate, WindowBits (..), feedDeflate, finishDeflate, flushDeflate, initDeflate)
 import           Data.ByteString.Builder          (Builder, byteString)
 import           Data.ByteString.Builder.Extra    (defaultChunkSize, flush)
 import           Data.ByteString.Builder.Internal (newBuffer)
 ------------------------------------------------------------------------------
 import           System.IO.Streams.Builder        (unsafeBuilderStream)
-import           System.IO.Streams.Internal       (InputStream, OutputStream, makeInputStream, makeOutputStream, read, write)
+import           System.IO.Streams.Internal       (InputStream, OutputStream, makeInputStream, makeOutputStream, read, write, unRead)
 
 
 ------------------------------------------------------------------------------
@@ -45,54 +50,108 @@ compressBits = WindowBits 15
 ------------------------------------------------------------------------------
 -- | Decompress an 'InputStream' of strict 'ByteString's from the @gzip@ format
 gunzip :: InputStream ByteString -> IO (InputStream ByteString)
-gunzip input = initInflate gzipBits >>= inflate input
+gunzip = inflateMulti 0x1F 0x8B gzipFormat defaultDecompressParams
+
+
+------------------------------------------------------------------------------
+-- | Decompress a single gzip stream from a an 'InputStream'.
+gunzipOne :: InputStream ByteString -> IO (InputStream ByteString)
+gunzipOne = inflateOne gzipFormat defaultDecompressParams
 
 
 ------------------------------------------------------------------------------
 -- | Decompress an 'InputStream' of strict 'ByteString's from the @zlib@ format
 decompress :: InputStream ByteString -> IO (InputStream ByteString)
-decompress input = initInflate compressBits >>= inflate input
+decompress = inflateOne zlibFormat defaultDecompressParams
 
 
 ------------------------------------------------------------------------------
--- Note: bytes pushed back to this input stream are not propagated back to the
--- source InputStream.
-data IS = Input
-        | Popper Popper
-        | Done
-
-inflate :: InputStream ByteString -> Inflate -> IO (InputStream ByteString)
-inflate input state = do
-    ref <- newIORef Input
+-- | Decompress a single compressed stream
+inflateOne :: Format -> DecompressParams
+           -> InputStream ByteString -> IO (InputStream ByteString)
+inflateOne fmt params input = do
+    ref <- newIORef (return $ decompressIO fmt params)
     makeInputStream $ stream ref
-
   where
-    stream ref = go
+    stream ref = join (readIORef ref) >>= go
       where
-        go = readIORef ref >>= \st ->
-             case st of
-               Input    -> read input >>= maybe eof chunk
-               Popper p -> pop p
-               Done     -> return Nothing
+        go st =
+            case st of
+              DecompressInputRequired feed -> do
+                  compressed <- readNonEmpty input
+                  feed (maybe S.empty id compressed) >>= go
+              DecompressOutputAvailable out next -> do
+                  writeIORef ref next
+                  return (Just out)
+              DecompressStreamEnd crumb -> do
+                  unRead crumb input
+                  return Nothing
+              DecompressStreamError err -> do
+                  throwIO err
 
-        eof = do
-            x <- finishInflate state
-            writeIORef ref Done
-            if (not $ S.null x)
-              then return $! Just x
-              else return Nothing
 
-        chunk s =
-            if S.null s
-              then do
-                  out <- flushInflate state
-                  return $! Just out
-              else feedInflate state s >>= \popper -> do
-                  writeIORef ref $ Popper popper
-                  pop popper
+------------------------------------------------------------------------------
+-- | Decompress one or more compressed streams
+inflateMulti :: Word8 -> Word8 -> Format -> DecompressParams
+             -> InputStream ByteString -> IO (InputStream ByteString)
+inflateMulti magic0 magic1 fmt params input = do
+    ref <- newIORef undefined
+    writeIORef ref (initStream ref)
+    makeInputStream $ join (readIORef ref)
+  where
+    initStream ref = init
+      where
+        init  = go (decompressIO fmt params)
+        go st =
+            case st of
+              DecompressInputRequired feed -> do
+                  compressed <- readNonEmpty input
+                  feed (maybe S.empty id compressed) >>= go
+              DecompressOutputAvailable out next -> do
+                  writeIORef ref (next >>= go)
+                  return (Just out)
+              DecompressStreamEnd crumb -> do
+                  unRead crumb input
+                  continue <- checkMagicBytes magic0 magic1 input
+                  if continue
+                  then init
+                  else return Nothing
+              DecompressStreamError err -> do
+                  throwIO err
 
-        pop popper = popper >>= maybe backToInput (return . Just)
-        backToInput = writeIORef ref Input >> read input >>= maybe eof chunk
+readNonEmpty :: InputStream ByteString -> IO (Maybe ByteString)
+readNonEmpty input = do
+    ma <- read input
+    case ma of
+      Just a | S.null a -> readNonEmpty input
+      _ -> return ma
+
+checkMagicBytes :: Word8 -> Word8 -> InputStream ByteString -> IO Bool
+checkMagicBytes magic0 magic1 input = do
+    ma <- readNonEmpty input
+    case ma of
+      Nothing -> return False
+      Just a
+        | S.length a > 1 ->
+          do
+             unRead a input
+             return (S.index a 0 == magic0 && S.index a 1 == magic1)
+        | otherwise {- S.length a == 1 -} ->
+          do
+             if S.index a 0 /= magic0
+             then do
+               unRead a input
+               return False
+             else do
+               mb <- readNonEmpty input
+               case mb of
+                 Nothing -> do
+                    unRead a input
+                    return False
+                 Just b  -> do
+                    unRead b input
+                    unRead a input
+                    return (S.index b 0 == magic1)
 
 
 ------------------------------------------------------------------------------
